@@ -55,7 +55,7 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
 | `GET` | `/diagnosis/latest` | 最新批次（默认包含未完成批次；`?completed_only=true` 只看有结论的批次） |
 | `GET` | `/diagnosis?limit=` | 最近批次列表 |
 | `PUT` | `/faults/{service}` | 设置 `live_ok` / `ready_ok` / `probe_delay_ms`，**递增全局状态版号** |
-| `POST` | `/faults/reset` | 清空所有本地故障，**递增全局状态版号** |
+| `POST` | `/faults/reset` | 清空所有本地故障，**递增全局状态版号**；回执 `observed_uncleared_faults` 反映重置后仍观测到的未清除故障（与重置交错的直改会保留并获得独立版号） |
 | `GET` | `/state` | 全局状态版号、批次序号、各服务采用的版号与配置轮次 |
 | `GET` | `/topology` | 依赖拓扑 |
 | `GET` | `/health` | 诊断 API 自身存活 |
@@ -103,6 +103,8 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
 - 某服务在依赖检查中等待超时（说明依赖的响应性未被证明）；
 - 证据自相矛盾：例如 readiness 声称某依赖未就绪，但该依赖自身探测通过；
   或触发了未声明的依赖；
+- 配置与版号未对齐：探测的 `config_epoch` 仍是诊断 API 未接纳的轮次
+  （直改已发生、监视器尚未递增独立版号），旧轮次证据不能当作当前结论；
 - 批次被重启打断 / 启动前已失效。
 
 ### 旧批次不覆盖新结果
@@ -126,14 +128,42 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
 `PUT /faults/{service}` 与 `POST /faults/reset` 都在全局锁内：
 
 1. `state_version += 1` 并持久化；
-2. 先把新版本同步到全部四个服务（`POST /_fault/sync`）；
-3. 再应用本地故障（目标服务的 `config_epoch` 随之递增）；
-4. 返回新版本、旧版本、各服务状态与警告（若有服务不可达导致同步失败，
+2. `PUT /faults/{service}` 先把新版本同步到全部四个服务（`POST /_fault/sync`），
+   再应用本地故障（目标服务的 `config_epoch` 随之递增）；`POST /faults/reset`
+   先逐服务复位、再同步新版本；
+3. 返回新版本、旧版本、各服务状态与警告（若有服务不可达导致同步失败，
    会明确提示「此时诊断只会给出待重测」）。
+4. 复位后若仍观测到非默认故障标志（说明直改落在该服务复位之后），再递增一个
+   独立版号并同步，回执 `observed_uncleared_faults` 列出这些未清除故障；详见
+   下节「重置与直改交错时的版号归属」。
 
 若有人绕过诊断 API 直接调用模拟服务的 `PUT /_fault`，后台监视器（默认 0.5s）
 通过 `config_epoch` 变化发现改动，同样递增并同步全局版号（探测进行中会跳过，
 下一轮补上）。
+
+### 重置与直改交错时的版号归属
+
+值班员批量清障（`POST /faults/reset`）与绕过 API 的直改可能交错。协调器按
+改动**实际发生的时间**而不是观察顺序来归属全局版号：
+
+- **直改发生在该服务的复位命令之后**（落在重置窗口内）：复位后重新观测状态，
+  仍带非默认故障标志的服务说明其配置被复位之后的直改覆盖。该直改被**保留**，
+  复位版号不占有它的 `config_epoch`，协调器再递增一个**独立的全局版号**并同步；
+  复位回执的 `observed_uncleared_faults` 列出观测到的未清除故障（服务、
+  `live_ok`/`ready_ok`/`probe_delay_ms`、`config_epoch`），并在 `warnings` 中说明。
+- **直改先于缓存复位、且尚未被监视器接纳**：复位命令重写该服务的配置，直改被
+  复位结果覆盖，**不**计作新变化，回执 `observed_uncleared_faults` 为空，只递增
+  复位自己的那一个版号；随后一轮监视器不会再为这个已被覆盖的轮次补涨版号。
+
+### 配置与版号未对齐时不得下结论
+
+一次批次除既有的新鲜度检查外，还要求每个服务的 `config_epoch` 已被诊断 API
+接纳（`GET /state` 的 `known_config_epochs`）。若探测携带的 `state_version`
+正确、但 `config_epoch` 仍是 API 未接纳的轮次（典型场景：直改已落到服务上、
+监视器尚未追上），批次返回 `needs_retest` 并在 `retest_reasons` 中说明
+「configuration and state version are not yet aligned」，旧轮次下的探测不会被
+当作当前确定结论。待监视器递增独立版号、配置与版号对齐后，再次诊断即可正确
+定位（例如缓存就绪故障被识别为唯一根因）。
 
 ## 目录结构
 
@@ -149,8 +179,9 @@ app/
   models.py       Pydantic 模型（驱动 OpenAPI）
   main.py         FastAPI 应用
 tests/
-  test_reduction.py  归约逻辑单元测试（14）
-  test_api.py        真实 uvicorn 进程端到端测试（19）
+  test_reduction.py         归约逻辑单元测试（18）
+  test_reset_interleaving.py 重置/直改两种交错与版号对齐的协调器测试（4，进程内假服务）
+  test_api.py               真实 uvicorn 进程端到端测试（22）
 ```
 
 ## 测试
@@ -163,7 +194,8 @@ python -m pytest -q
 测试用随机端口启动 4 个模拟服务与诊断 API 的真实进程，覆盖：健康、四类故障、
 缓存故障去重、双独立故障、超时、版号混杂、依赖检查超时、并发探测、异步批次与
 迟到响应、等待预算到期返回 202 后轮询、重启恢复、版号冲突、Swagger/OpenAPI、
-未知服务。
+未知服务，以及重置与绕过 API 直改的两种交错（直改在复位后保留并获独立版号、
+直改在复位前被覆盖而不计新变化）和配置/版号未对齐时的 `needs_retest` 守卫。
 
 ## 已知限制
 

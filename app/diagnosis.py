@@ -70,10 +70,12 @@ def evaluate(
     current_version: int,
     baseline_epochs: dict[str, int | None],
     probe_timeout_seconds: float,
+    adopted_epochs: dict[str, int | None] | None = None,
 ) -> dict[str, Any]:
     """Reduce one batch of probe results into a diagnosis verdict."""
     evidence: list[str] = []
     retest_reasons: list[str] = []
+    adopted_epochs = adopted_epochs or {}
 
     # -- 1. Freshness / consistency gate -------------------------------
     for service in SERVICES:
@@ -124,6 +126,24 @@ def evaluate(
             retest_reasons.append(
                 f"{service} live/ready disagreed on state_version: "
                 f"{sorted(observed_versions)}"
+            )
+
+    # Configuration/version alignment gate. A probe may carry the expected
+    # state_version simply because the global version was re-synchronised while
+    # the service's local configuration (config_epoch) is still one the API has
+    # not adopted — e.g. a direct service write that the watcher has not caught
+    # up with. Such evidence describes an older, un-aligned configuration and
+    # must not be presented as a confident verdict for the current state; the
+    # caller is asked to retest once version and configuration have converged.
+    for service in SERVICES:
+        adopted = adopted_epochs.get(service)
+        baseline = baseline_epochs.get(service)
+        if adopted is not None and baseline is not None and baseline != adopted:
+            retest_reasons.append(
+                f"{service} is serving config_epoch {baseline} but the diagnosis "
+                f"API has only adopted config_epoch {adopted} for state version "
+                f"{expected_version}; configuration and state version are not yet "
+                "aligned, so this probe cannot be treated as a current verdict"
             )
 
     if current_version != expected_version:

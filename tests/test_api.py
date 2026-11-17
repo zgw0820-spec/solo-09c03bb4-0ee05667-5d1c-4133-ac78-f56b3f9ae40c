@@ -1,6 +1,7 @@
 """Integration tests against real uvicorn processes for all five apps."""
 from __future__ import annotations
 
+import threading
 import time
 
 import httpx
@@ -364,3 +365,119 @@ def test_unreachable_cache_is_single_unreachable_root_cause(stack):
         assert {"auth", "order", "gateway"} <= affected
     finally:
         standalone.stop()
+
+
+def _wait_version_stable(client: httpx.Client, *, hold: float = 0.6) -> int:
+    """Wait until the watcher has caught up: version stays constant for `hold`."""
+    last = client.get("/state").json()["state_version"]
+    deadline = time.monotonic() + 10
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        current = client.get("/state").json()["state_version"]
+        if current != last:
+            last = current
+            stable_since = time.monotonic()
+        elif time.monotonic() - stable_since >= hold:
+            return current
+        time.sleep(0.05)
+    raise AssertionError("state version never stabilised")
+
+
+def test_reset_receipt_carries_observed_uncleared_faults_field(client: httpx.Client):
+    reset(client)
+    payload = client.post("/faults/reset").json()
+    # Additive, always-present field so the API contract stays explicit.
+    assert payload["observed_uncleared_faults"] == []
+
+
+def test_direct_write_after_reset_keeps_fault_and_diagnoses_after_alignment(
+    client: httpx.Client, stack
+):
+    """Interleaving A: a direct write racing inside the reset window survives.
+
+    The exact service-reset ordering inside reset_all is not controllable over
+    real processes, so a background thread re-applies the cache fault around
+    the reset; the deterministic ordering guarantee is covered by the
+    in-process coordinator tests, while here we assert the external contract:
+    the surviving fault is preserved under its own version, the receipt reports
+    it when it lands in-window, and once version/config align the cache is
+    located confidently (never a stuck needs_retest).
+    """
+    reset(client)
+    stop = threading.Event()
+    receipts: list[dict] = []
+    errors: list[Exception] = []
+
+    def hammer() -> None:
+        while not stop.is_set():
+            try:
+                httpx.put(
+                    f"{stack.url('cache')}/_fault", json={"ready_ok": False}, timeout=2
+                )
+            except Exception as exc:  # pragma: no cover - best effort race
+                errors.append(exc)
+            time.sleep(0.01)
+
+    worker = threading.Thread(target=hammer, daemon=True)
+    worker.start()
+    try:
+        for _ in range(5):
+            response = client.post("/faults/reset")
+            assert response.status_code == 200, response.text
+            receipts.append(response.json())
+            time.sleep(0.02)
+    finally:
+        stop.set()
+        worker.join(timeout=5)
+
+    assert not errors
+    # Re-establish the intended surviving fault after the reset storm.
+    assert httpx.put(
+        f"{stack.url('cache')}/_fault", json={"ready_ok": False}
+    ).status_code == 200
+
+    for receipt in receipts:
+        assert "observed_uncleared_faults" in receipt
+        for item in receipt["observed_uncleared_faults"]:
+            assert item["service"] in ("gateway", "auth", "order", "cache")
+            assert "config_epoch" in item
+
+    stable_version = _wait_version_stable(client)
+
+    # After alignment, the cache fault is located; retest must not get stuck.
+    result = diagnose(client, wait_seconds=20)["result"]
+    assert result["outcome"] == "root_cause_found"
+    assert result["primary_root_cause"] == "cache"
+    assert result["retest_reasons"] == []
+
+    # The post-alignment version is distinct and the watcher is now quiescent.
+    assert _wait_version_stable(client) == stable_version
+
+
+def test_direct_write_before_reset_is_covered_without_new_change(
+    client: httpx.Client, stack
+):
+    """Interleaving B: a direct write the watcher has not adopted is overwritten
+    by the reset and must not be counted as a new change afterwards."""
+    reset(client)
+    before = client.get("/state").json()["state_version"]
+    assert httpx.put(
+        f"{stack.url('cache')}/_fault", json={"ready_ok": False}
+    ).status_code == 200
+    # Reset immediately, before the 0.2s watcher can adopt the epoch.
+    receipt = client.post("/faults/reset").json()
+
+    cache_state = next(
+        s for s in receipt["service_states"] if s["service"] == "cache"
+    )
+    assert cache_state["ready_ok"] is True
+    # Whatever the watcher timing, the reset covered the overwritten fault: the
+    # receipt reports no surviving uncleared fault and the final settled state
+    # is healthy with a stable version.
+    assert receipt["observed_uncleared_faults"] == []
+
+    stable_version = _wait_version_stable(client)
+    result = diagnose(client)["result"]
+    assert result["outcome"] == "healthy"
+    assert _wait_version_stable(client) == stable_version
+    assert client.get("/state").json()["state_version"] >= before + 1

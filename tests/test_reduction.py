@@ -72,7 +72,7 @@ def healthy_probes(version: int = 5) -> dict:
     }
 
 
-def run(probes=None, *, version=5, current=None, epochs=None):
+def run(probes=None, *, version=5, current=None, epochs=None, adopted=None):
     probes = probes or healthy_probes(version)
     for name in SERVICES:
         if name in probes:
@@ -82,6 +82,7 @@ def run(probes=None, *, version=5, current=None, epochs=None):
         expected_version=version,
         current_version=version if current is None else current,
         baseline_epochs=epochs or {name: 1 for name in SERVICES},
+        adopted_epochs=adopted,
         probe_timeout_seconds=2.0,
     )
 
@@ -242,3 +243,54 @@ def test_unreachable_service_is_a_root_cause_not_a_timeout():
     assert result["outcome"] == "root_cause_found"
     assert result["independent_faults_count"] == 1
     assert result["root_causes"][0]["failure"] == "unreachable"
+
+
+def test_unadopted_config_epoch_forces_retest_even_while_version_matches():
+    # The service answers with the expected state_version, but its config_epoch
+    # is one the API has not adopted yet (a direct write pending watcher
+    # adoption). Version and configuration are not aligned: no confident call.
+    probes = healthy_probes()
+    probes["cache"] = probe(
+        ok_v(epoch=2), fail_v(epoch=2, local_ready_ok=False)
+    )
+    # Baseline matches what was actually observed at batch start (epoch 2); the
+    # mid-probe guard stays quiet and only the adoption gate fires.
+    epochs = {name: 1 for name in SERVICES}
+    epochs["cache"] = 2
+    adopted = {name: 1 for name in SERVICES}
+    result = run(probes, epochs=epochs, adopted=adopted)
+    assert result["outcome"] == "needs_retest"
+    assert result["root_causes"] == []
+    assert any("not yet aligned" in reason for reason in result["retest_reasons"])
+    assert any("cache" in reason for reason in result["retest_reasons"])
+
+
+def test_aligned_adopted_epochs_allow_a_verdict():
+    # Same evidence, but the API has adopted epoch 2 for every service.
+    probes = healthy_probes()
+    probes["cache"] = probe(
+        ok_v(epoch=2), fail_v(epoch=2, local_ready_ok=False)
+    )
+    probes["auth"] = probe(ok_v(), fail_v(blocking=["cache"]))
+    probes["order"] = probe(ok_v(), fail_v(blocking=["cache"]))
+    probes["gateway"] = probe(ok_v(), fail_v(blocking=["auth", "order"]))
+    epochs = {name: 1 for name in SERVICES}
+    epochs["cache"] = 2
+    adopted = {name: 1 for name in SERVICES}
+    adopted["cache"] = 2
+    result = run(probes, epochs=epochs, adopted=adopted)
+    assert result["outcome"] == "root_cause_found"
+    assert result["primary_root_cause"] == "cache"
+    assert result["retest_reasons"] == []
+
+
+def test_unknown_adopted_epoch_does_not_gate():
+    # Before the API has learned an epoch for a service (None), the alignment
+    # gate stays silent; the ordinary freshness rules still apply.
+    result = run(adopted={name: None for name in SERVICES})
+    assert result["outcome"] == "healthy"
+
+
+def test_adopted_epochs_parameter_is_optional():
+    # Existing callers that do not pass adopted epochs keep the old behavior.
+    assert run()["outcome"] == "healthy"

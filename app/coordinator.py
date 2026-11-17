@@ -82,6 +82,36 @@ class Coordinator:
         self.store.set_meta("batch_seq", str(self.batch_seq))
         return self.batch_seq
 
+    @staticmethod
+    def _is_default_fault_state(state: dict[str, Any]) -> bool:
+        return (
+            state.get("live_ok") is True
+            and state.get("ready_ok") is True
+            and (state.get("probe_delay_ms") or 0) == 0
+        )
+
+    def _uncleared_faults(self, states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reachable services whose observed fault settings are not the clean defaults."""
+        uncleared: list[dict[str, Any]] = []
+        for state in states:
+            if not state.get("reachable") or self._is_default_fault_state(state):
+                continue
+            uncleared.append(
+                {
+                    "service": state["service"],
+                    "live_ok": state.get("live_ok"),
+                    "ready_ok": state.get("ready_ok"),
+                    "probe_delay_ms": state.get("probe_delay_ms"),
+                    "config_epoch": state.get("config_epoch"),
+                }
+            )
+        return uncleared
+
+    def _adopt_reachable_epochs(self, states: list[dict[str, Any]]) -> None:
+        for state in states:
+            if state.get("reachable") and state.get("config_epoch") is not None:
+                self._expected_epochs[state["service"]] = state["config_epoch"]
+
     # -- startup -------------------------------------------------------
     async def recover_after_restart(self) -> int:
         """Mark batches abandoned by the previous process; re-adopt version.
@@ -164,9 +194,7 @@ class Coordinator:
             # Always refresh what we believe the epochs are, so a failure to
             # bump is retried only once (a stuck service is reported by its
             # probes instead).
-            for state in states:
-                if state.get("reachable") and state.get("config_epoch") is not None:
-                    self._expected_epochs[state["service"]] = state["config_epoch"]
+            self._adopt_reachable_epochs(states)
             return bool(changed)
 
     # -- fault injection ----------------------------------------------
@@ -192,6 +220,15 @@ class Coordinator:
             # after the fault see one consistent version.
             client = await self._make_client()
             try:
+                # Snapshot epochs *before* our admin call: an epoch that moves
+                # on a different service during this call is an external write,
+                # not something this command is allowed to adopt silently.
+                before_states = await client.snapshot_states()
+                epochs_before = {
+                    state["service"]: state.get("config_epoch")
+                    for state in before_states
+                    if state.get("reachable")
+                }
                 sync_states = await client.sync_all(current)
                 applied = True
                 error: str | None = None
@@ -204,8 +241,17 @@ class Coordinator:
                     error = str(exc)
                 states_after = await client.snapshot_states()
                 for state in states_after:
-                    if state.get("reachable") and state.get("config_epoch") is not None:
-                        self._expected_epochs[state["service"]] = state["config_epoch"]
+                    if not state.get("reachable") or state.get("config_epoch") is None:
+                        continue
+                    name = state["service"]
+                    if name == service:
+                        # The target epoch is owned by this command.
+                        self._expected_epochs[name] = state["config_epoch"]
+                    elif state["config_epoch"] == epochs_before.get(name):
+                        # Unchanged by anyone: keep the adopted baseline in sync.
+                        self._expected_epochs[name] = state["config_epoch"]
+                    # else: another service's epoch moved out-of-band; leave it
+                    # un-adopted so the watcher bumps a separate version for it.
             finally:
                 await self._close_client(client)
 
@@ -237,23 +283,46 @@ class Coordinator:
         async with self._state_lock:
             if expected_version is not None and expected_version != self.state_version:
                 raise VersionConflictError(expected_version, self.state_version)
-            previous, current = self._bump_version_locked()
+            previous, reset_version = self._bump_version_locked()
             client = await self._make_client()
+            warnings: list[str] = []
             try:
                 results = await client.reset_all()
-                sync_states = await client.sync_all(current)
+                sync_states = await client.sync_all(reset_version)
                 states_after = await client.snapshot_states()
-                for state in states_after:
-                    if state.get("reachable") and state.get("config_epoch") is not None:
-                        self._expected_epochs[state["service"]] = state["config_epoch"]
+
+                # A service still carrying non-default fault settings was
+                # rewritten *after* its own reset ran (a direct write landing
+                # inside the reset window). The reset's version must not own
+                # that epoch: the surviving direct change is preserved and
+                # gets its own global version, and the receipt reports it.
+                uncleared = self._uncleared_faults(states_after)
+                current = reset_version
+                if uncleared:
+                    _, current = self._bump_version_locked()
+                    sync_states = await client.sync_all(current)
+                    warnings.append(
+                        "observed local faults still present after the reset "
+                        "(a direct service write interleaved with the reset); "
+                        "they were preserved and assigned a separate global "
+                        f"state version {current}: "
+                        + ", ".join(item["service"] for item in uncleared)
+                    )
+                    states_after = await client.snapshot_states()
+
+                # Every reachable epoch in the final snapshot is owned either
+                # by the reset version (clean path) or by the extra version
+                # bumped for an interleaving write; adopt them so the watcher
+                # only reacts to changes that happen *after* this response.
+                self._adopt_reachable_epochs(states_after)
             finally:
                 await self._close_client(client)
 
-        warnings = [
+        warnings.extend(
             f"could not reset {item['service']}: {item['error']}"
             for item in results
             if not item.get("reset")
-        ]
+        )
         unsynced = [s["service"] for s in sync_states if not s.get("synced")]
         if unsynced:
             warnings.append("state version sync failed for: " + ", ".join(unsynced))
@@ -261,6 +330,7 @@ class Coordinator:
             "state_version": current,
             "previous_state_version": previous,
             "service_states": await self.service_states(),
+            "observed_uncleared_faults": uncleared,
             "warnings": warnings,
         }
 
@@ -352,6 +422,7 @@ class Coordinator:
                         expected_version=expected_version,
                         current_version=self.state_version,
                         baseline_epochs=baseline_epochs,
+                        adopted_epochs=self.snapshot_epochs(),
                         probe_timeout_seconds=self.settings.probe_timeout_seconds,
                     )
                 else:

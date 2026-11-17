@@ -59,10 +59,33 @@ class FaultSetResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ObservedUnclearedFault(BaseModel):
+    """A local fault still present on a service immediately after a reset.
+
+    This means a direct write to the service interleaved with the reset: the
+    reset's own version does not own that configuration, so it is preserved and
+    assigned a separate global state version.
+    """
+
+    service: str
+    live_ok: bool | None = None
+    ready_ok: bool | None = None
+    probe_delay_ms: int | None = None
+    config_epoch: int | None = None
+
+
 class ResetFaultsResponse(BaseModel):
     state_version: int
     previous_state_version: int
     service_states: list[MockState]
+    observed_uncleared_faults: list[ObservedUnclearedFault] = Field(
+        default_factory=list,
+        description=(
+            "Local faults still observed after the reset (direct writes that "
+            "landed inside the reset window). They are preserved and covered by "
+            "the separate state version reported in this receipt."
+        ),
+    )
     warnings: list[str] = Field(default_factory=list)
 
 
